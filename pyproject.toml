@@ -61,6 +61,10 @@ lint.ignore = [
   "PLR2004", # Magic value used in comparison
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Whitebox-testing private helpers directly is intentional here.
+"tests/test_ca_diff.py" = ["SLF001"]
+
 [tool.pytest.ini_options]
 addopts = "-n auto"
 

@@ -128,6 +128,7 @@ def pr_command(args: argparse.Namespace) -> str:
                         show_header=not args.no_headers,
                         show_logs=not args.no_logs,
                         show_pr_info=not args.no_pr_info,
+                        ca_diff=args.ca_diff,
                     ),
                     shell_options=ShellOptions(
                         no_shell=args.no_shell,

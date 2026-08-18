@@ -8,7 +8,7 @@ rec {
   system = builtins.currentSystem;
 
   mkDerivation = args:
-    derivation ({
+    (derivation ({
       inherit system;
       builder = shell;
       args = ["-e" args.builder or (builtins.toFile "builder-${args.name}.sh" ''
@@ -17,5 +17,10 @@ rec {
       '')];
       PATH = path;
     } // removeAttrs args ["builder" "meta"])
-    // { meta = args.meta or {}; };
+    // { meta = args.meta or {}; })
+    // {
+      # Minimal stand-in for stdenv's real overrideAttrs, so CA-diff's
+      # per-package overrideAttrs override can be exercised in tests.
+      overrideAttrs = f: mkDerivation (args // (if builtins.isFunction f then f args else f));
+    };
 }

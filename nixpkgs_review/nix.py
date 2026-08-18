@@ -43,6 +43,11 @@ class Attr:
     drv_path: Path | None
     aliases: list[str] = field(default_factory=list)
     store: str | None = None
+    ca_status: str | None = None
+    ca_realized_outputs: dict[str, Path] | None = None
+    ca_bucket: str | None = None
+    ca_base_outputs: dict[str, Path] | None = None
+    ca_merged_outputs: dict[str, Path] | None = None
     _path_verified: bool | None = field(init=False, default=None)
 
     def was_build(self) -> bool:
@@ -103,10 +108,13 @@ def _nix_common_flags(
     nix_path: str,
     store: str | None = None,
     eval_store: str | None = None,
+    *,
+    ca: bool = False,
 ) -> list[str]:
+    features = "nix-command ca-derivations" if ca else "nix-command"
     return [
         "--extra-experimental-features",
-        "nix-command",
+        features,
         *([] if allow.url_literals else ["--option", "lint-url-literals", "fatal"]),
         "--nix-path",
         nix_path,
@@ -285,6 +293,7 @@ class NixEvalProps(TypedDict):
 class NixEvalPropsExtra(TypedDict):
     exists: bool
     broken: bool
+    caStatus: NotRequired[str]
 
 
 NixEvalResult = list[NixEvalProps]
@@ -313,7 +322,14 @@ def _nix_eval_filter(packages: NixEvalResult, store: str | None) -> list[Attr]:
 
         if not extra_value.get("broken", True):
             drv_path = Path(props["drvPath"])
-            outputs = {output: Path(path) for output, path in props["outputs"].items()}
+            # Floating CA derivations have no known output path at eval
+            # time (it depends on the build result), so nix-eval-jobs
+            # reports it as null; skip those rather than crash.
+            outputs = {
+                output: Path(path)
+                for output, path in props["outputs"].items()
+                if path is not None
+            }
 
         # the 'name' field might be quoted, so get the unqoted one from 'attrPath'
         name = ".".join(props["attrPath"][1:])
@@ -325,6 +341,7 @@ def _nix_eval_filter(packages: NixEvalResult, store: str | None) -> list[Attr]:
             outputs=outputs,
             drv_path=drv_path,
             store=store,
+            ca_status=extra_value.get("caStatus"),
         )
         if attr.drv_path is not None:
             if (other := attr_by_path.get(attr.drv_path)) is None:
@@ -342,6 +359,8 @@ def _nix_eval_filter(packages: NixEvalResult, store: str | None) -> list[Attr]:
 def multi_system_eval(
     attr_names_per_system: dict[System, set[str]],
     build_config: BuildConfig,
+    *,
+    ca: bool = False,
 ) -> dict[System, list[Attr]]:
     attr_json = NamedTemporaryFile(mode="w+", delete=False)  # noqa: SIM115
     delete = True
@@ -350,25 +369,27 @@ def multi_system_eval(
             {system: list(attrs) for system, attrs in attr_names_per_system.items()},
             attr_json,
         )
-        eval_script = str(ROOT.joinpath("nix/evalAttrs.nix"))
+        eval_script = str(ROOT.joinpath(f"nix/evalAttrs{'CA' if ca else ''}.nix"))
         attr_json.flush()
+        apply_fields = "exists broken caStatus" if ca else "exists broken"
         cmd = [
             "nix-eval-jobs",
             "--workers",
             str(build_config.num_eval_workers),
             "--max-memory-size",
             str(build_config.max_memory_size),
-            "--no-instantiate",
+            *([] if ca else ["--no-instantiate"]),
             *_nix_common_flags(
                 build_config.allow,
                 build_config.nix_path,
                 build_config.store,
                 build_config.eval_store,
+                ca=ca,
             ),
             "--expr",
             f"(import {eval_script} {{ attr-json = {attr_json.name}; }})",
             "--apply",
-            "d: { inherit (d) exists broken; }",
+            f"d: {{ inherit (d) {apply_fields}; }}",
         ]
 
         info("$ " + shlex.join(cmd))
@@ -405,6 +426,61 @@ def multi_system_eval(
         attr_json.close()
         if delete:
             Path(attr_json.name).unlink()
+
+
+def ca_realize(
+    drv_paths: list[Path],
+    build_config: BuildConfig,
+) -> dict[Path, dict[str, Path]]:
+    """Build the given (already content-addressed) drv paths directly and
+    return the realized output paths per drv.
+
+    A drv missing from the result means its build failed; this is
+    best-effort (--keep-going), not fatal, since ca-derivations is
+    experimental and expected to fail on some packages.
+    """
+    if not drv_paths:
+        return {}
+
+    cmd = [
+        "nix",
+        "build",
+        *_nix_common_flags(
+            build_config.allow,
+            build_config.nix_path,
+            build_config.store,
+            build_config.eval_store,
+            ca=True,
+        ),
+        "--no-link",
+        "--keep-going",
+        "--json",
+        *[f"{drv_path}^*" for drv_path in drv_paths],
+    ]
+
+    if platform == "linux":
+        command_extra = ["--option", "build-use-sandbox", "relaxed"]
+        cmd += command_extra
+
+    info("$ " + shlex.join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=False)
+
+    realized: dict[Path, dict[str, Path]] = {}
+    if not res.stdout.strip():
+        return realized
+    try:
+        results = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return realized
+
+    for entry in results:
+        drv_path = Path(entry["drvPath"])
+        outputs = {
+            name: Path(path) for name, path in entry.get("outputs", {}).items() if path
+        }
+        if outputs:
+            realized[drv_path] = outputs
+    return realized
 
 
 def nix_build(

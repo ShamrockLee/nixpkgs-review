@@ -337,6 +337,16 @@ def common_flags() -> list[CommonFlag]:
             "passed verbatim to nix as `--eval-store` (e.g. `auto`). Useful with "
             "a remote/slow --store (e.g. nixbuild.net) to keep evaluation local.",
         ),
+        CommonFlag(
+            "--ca-diff",
+            action="store_true",
+            help="EXPERIMENTAL: for each impacted package, build it as a "
+            "content-addressed derivation on both the base and reviewed "
+            "revision, and report whether the output is provably unchanged. "
+            "Requires --store (ca-derivations has known store-corruption bugs; "
+            "use --store auto to target the real store anyway). Report-only: "
+            "implies --no-shell.",
+        ),
     ]
 
 
@@ -416,6 +426,19 @@ def check_common_flags(args: argparse.Namespace) -> bool:
     elif args.no_shell:
         print("--no-shell and --run are mutually exclusive", file=sys.stderr)
         return False
+
+    if args.ca_diff and args.store is None:
+        print(
+            "--ca-diff requires --store: ca-derivations is experimental and has "
+            "known store-corruption bugs (e.g. NixOS/nix#14107), so CA builds must "
+            "not run against your real Nix store.\n"
+            "Pass a disposable store, e.g. --store 'local?root=/tmp/ca-diff-store', "
+            "or explicitly opt into your real store with --store auto "
+            "(this constraint may be lifted once ca-derivations stabilizes).",
+            file=sys.stderr,
+        )
+        return False
+
     return True
 
 

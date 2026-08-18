@@ -18,9 +18,17 @@ from . import git, http_requests
 from .builddir import Builddir
 from .errors import NixpkgsReviewError
 from .github import GithubClient, GitHubPullRequest
-from .nix import Attr, BuildConfig, ShellConfig, multi_system_eval, nix_build, nix_shell
+from .nix import (
+    Attr,
+    BuildConfig,
+    ShellConfig,
+    ca_realize,
+    multi_system_eval,
+    nix_build,
+    nix_shell,
+)
 from .nixpkgs import fetch_refs
-from .report import Report, ReportOptions
+from .report import Report, ReportOptions, get_nix_config
 from .utils import (
     PackageFilter,
     System,
@@ -45,6 +53,11 @@ PLATFORMS_DARWIN: set[str] = {"aarch64-darwin", "x86_64-darwin"}
 PLATFORMS_AARCH64: set[str] = {"aarch64-darwin", "aarch64-linux"}
 PLATFORMS_X64: set[str] = {"x86_64-darwin", "x86_64-linux"}
 PLATFORMS: set[str] = PLATFORMS_LINUX.union(PLATFORMS_DARWIN)
+
+# ca_status values (see nix/evalAttrsCA.nix) for which a package stayed
+# input-addressed, so its output path is not a reliable signal of content
+# and cannot be compared across revisions.
+CA_NOT_COMPARABLE_STATUSES: set[str] = {"opted-out", "cannot-override"}
 
 
 @dataclass(frozen=True)
@@ -83,6 +96,7 @@ class ReviewConfig:
     show_header: bool = True
     show_logs: bool = False
     show_pr_info: bool = True
+    ca_diff: bool = False
 
 
 def _prefix_with_pkgs(packages: set[str], pkgs: str | None) -> set[str]:
@@ -178,7 +192,13 @@ class Review:
     @property
     def _use_github_eval(self) -> bool:
         # If the user explicitly asks for local eval, just do it
-        if self.review_config.eval_type == "local" or self.package_filter.only_packages:
+        if (
+            self.review_config.eval_type == "local"
+            or self.package_filter.only_packages
+            # --ca-diff needs to build the base revision too, which GitHub's
+            # eval result can't provide.
+            or self.review_config.ca_diff
+        ):
             return False
 
         if self.build_config.pkgs:
@@ -342,6 +362,14 @@ class Review:
             msg = f"Failed to checkout {commit} in {self.worktree_dir()}. git checkout failed with exit code {res.returncode}"
             raise NixpkgsReviewError(msg)
 
+    def _abort_in_progress_merge(self) -> None:
+        # `git merge --no-commit` leaves MERGE_HEAD in place; a plain
+        # `git checkout` doesn't clear it, so a later `git_merge` call on the
+        # same worktree fails with "local changes would be overwritten" even
+        # though the working tree itself is clean. Ignore the exit code:
+        # this is a harmless no-op when no merge is in progress.
+        git.run(["merge", "--abort"], cwd=self.worktree_dir())
+
     def apply_unstaged(self, *, staged: bool = False) -> None:
         args = [
             "--no-pager",
@@ -363,6 +391,30 @@ class Review:
         if result.returncode != 0:
             die(f"Failed to apply diff in {self.worktree_dir()}")
 
+    def _checkout_review_target(
+        self,
+        base_commit: str,
+        head_commit: str | None,
+        merge_commit: str | None,
+        *,
+        staged: bool = False,
+    ) -> None:
+        """Move the worktree to the state that should be built: the merged
+        PR/commit per --checkout, or the base for --checkout base."""
+        if head_commit is None:
+            self.apply_unstaged(staged=staged)
+            return
+        match self.review_config.checkout:
+            case CheckoutOption.COMMIT:
+                self.git_checkout(head_commit)
+            case CheckoutOption.MERGE:
+                if merge_commit:
+                    self.git_checkout(merge_commit)
+                else:
+                    self.git_merge(head_commit)
+            case CheckoutOption.BASE:
+                self.git_checkout(base_commit)
+
     def _build_commit_packages(
         self,
         base_commit: str,
@@ -371,19 +423,9 @@ class Review:
         *,
         staged: bool = False,
     ) -> dict[System, list[Attr]]:
-        if head_commit is None:
-            self.apply_unstaged(staged=staged)
-        else:
-            match self.review_config.checkout:
-                case CheckoutOption.COMMIT:
-                    self.git_checkout(head_commit)
-                case CheckoutOption.MERGE:
-                    if merge_commit:
-                        self.git_checkout(merge_commit)
-                    else:
-                        self.git_merge(head_commit)
-                case CheckoutOption.BASE:
-                    self.git_checkout(base_commit)
+        self._checkout_review_target(
+            base_commit, head_commit, merge_commit, staged=staged
+        )
 
         changed_attrs = {
             system: _prefix_with_pkgs(
@@ -392,6 +434,14 @@ class Review:
             for system in self.systems
         }
 
+        if self.review_config.ca_diff:
+            return self._ca_diff(
+                changed_attrs,
+                base_commit,
+                lambda: self._checkout_review_target(
+                    base_commit, head_commit, merge_commit, staged=staged
+                ),
+            )
         return self.build(changed_attrs, self.shell_options.build_args)
 
     def build_commit(
@@ -457,12 +507,219 @@ class Review:
 
             changed_attrs[system] = {p.attr_path for p in changed_pkgs}
 
+        if self.review_config.ca_diff:
+            return self._ca_diff_after_merged_eval(
+                changed_attrs, base_commit, head_commit, merge_commit, staged=staged
+            )
+
         if head_commit and self.review_config.checkout == CheckoutOption.COMMIT:
             self.git_checkout(head_commit)
         elif base_commit and self.review_config.checkout == CheckoutOption.BASE:
             self.git_checkout(base_commit)
 
         return self.build(changed_attrs, self.shell_options.build_args)
+
+    def _ca_diff_after_merged_eval(
+        self,
+        changed_attrs: dict[System, set[str]],
+        base_commit: str,
+        head_commit: str | None,
+        merge_commit: str | None,
+        *,
+        staged: bool,
+    ) -> dict[System, list[Attr]]:
+        # The worktree is already at "merged" (needed for the diff eval
+        # build_commit just ran); re-derive that same state to restore it
+        # after ca-diff has moved to base and back. --checkout commit/base
+        # don't apply here since ca-diff is report-only (no shell to reflect
+        # them).
+        def reach_merged() -> None:
+            self.git_checkout(base_commit)
+            if head_commit is None:
+                self.apply_unstaged(staged=staged)
+            elif merge_commit:
+                self.git_checkout(merge_commit)
+            else:
+                self.git_merge(head_commit)
+
+        return self._ca_diff(changed_attrs, base_commit, reach_merged)
+
+    def _ca_build_all(
+        self, packages_per_system: dict[System, set[str]]
+    ) -> dict[System, list[Attr]]:
+        """Evaluate and build the given attrs as content-addressed
+        derivations on whatever revision is currently checked out."""
+        attrs_per_system = multi_system_eval(
+            packages_per_system, self.build_config, ca=True
+        )
+        drv_paths = [
+            attr.drv_path
+            for attrs in attrs_per_system.values()
+            for attr in attrs
+            if attr.drv_path is not None and not attr.broken and not attr.blacklisted
+        ]
+        realized = ca_realize(drv_paths, self.build_config)
+        for attrs in attrs_per_system.values():
+            for attr in attrs:
+                if attr.drv_path is not None:
+                    attr.ca_realized_outputs = realized.get(attr.drv_path)
+        return attrs_per_system
+
+    def _ca_drv_references(self, drv_paths: list[Path]) -> dict[Path, set[Path]]:
+        """Immediate references (inputDrvs/inputSrcs) of each drv; used to
+        build the changed-set dependency graph for taint propagation."""
+        store_flags = (
+            ["--store", self.build_config.store] if self.build_config.store else []
+        )
+        refs: dict[Path, set[Path]] = {}
+        for drv_path in drv_paths:
+            res = subprocess.run(
+                ["nix-store", "--query", "--references", *store_flags, str(drv_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            refs[drv_path] = {
+                Path(line) for line in res.stdout.splitlines() if line.strip()
+            }
+        return refs
+
+    @staticmethod
+    def _ca_bucket_attr(merged: Attr | None, base: Attr | None) -> Attr:
+        attr = merged or base
+        assert attr is not None
+        attr.ca_base_outputs = base.ca_realized_outputs if base else None
+        attr.ca_merged_outputs = merged.ca_realized_outputs if merged else None
+
+        merged_ok = merged is not None and not merged.broken
+        base_ok = base is not None and not base.broken
+
+        if merged_ok and not base_ok:
+            attr.ca_bucket = "added"
+        elif base_ok and not merged_ok:
+            attr.ca_bucket = "removed"
+        elif not merged_ok and not base_ok:
+            attr.ca_bucket = "ca-build-failed"
+        else:
+            assert merged is not None
+            assert base is not None
+            if (
+                merged.ca_status in CA_NOT_COMPARABLE_STATUSES
+                or base.ca_status in CA_NOT_COMPARABLE_STATUSES
+            ):
+                attr.ca_bucket = "not-comparable"
+            elif merged.ca_realized_outputs is None or base.ca_realized_outputs is None:
+                attr.ca_bucket = "ca-build-failed"
+            elif merged.ca_realized_outputs == base.ca_realized_outputs:
+                attr.ca_bucket = "unchanged"
+            else:
+                attr.ca_bucket = "changed"
+        return attr
+
+    def _ca_taint_propagate(self, attrs: list[Attr]) -> None:
+        """A package that stayed input-addressed (CA opt-out) can flip a
+        "changed" verdict on its dependents purely by its own path churning,
+        even when its content is identical. Downgrade such dependents to
+        "changed-inconclusive". "unchanged" verdicts never need this: they
+        don't depend on what any dependency's path looked like.
+        """
+        by_drv = {a.drv_path: a for a in attrs if a.drv_path is not None}
+        if not by_drv:
+            return
+        references = self._ca_drv_references(list(by_drv.keys()))
+        tainted_cache: dict[Path, bool] = {}
+
+        def is_tainted(drv_path: Path) -> bool:
+            if drv_path in tainted_cache:
+                return tainted_cache[drv_path]
+            tainted_cache[drv_path] = False  # break cycles conservatively
+            attr = by_drv.get(drv_path)
+            if attr is not None and attr.ca_bucket == "unchanged":
+                # Proven byte-identical regardless of what's beneath it:
+                # taint stops here, it doesn't matter what its own
+                # dependencies looked like.
+                result = False
+            elif attr is not None and attr.ca_bucket == "not-comparable":
+                result = True
+            else:
+                result = any(
+                    ref in by_drv and is_tainted(ref)
+                    for ref in references.get(drv_path, ())
+                )
+            tainted_cache[drv_path] = result
+            return result
+
+        for attr in attrs:
+            if attr.drv_path is None or attr.ca_bucket != "changed":
+                continue
+            if any(
+                ref in by_drv and is_tainted(ref)
+                for ref in references.get(attr.drv_path, ())
+            ):
+                attr.ca_bucket = "changed-inconclusive"
+
+    def _check_ca_daemon_preflight(self) -> None:
+        """`--extra-experimental-features` only unlocks ca-derivations for
+        client-side work; a store routed through a nix-daemon (anything but
+        a chroot `local?root=...`/plain-path store) needs the daemon's own
+        nix.conf to enable it, or realisation fails. Best-effort: `nix
+        config show` reflects the local client's config, which usually --
+        but not always -- matches what a local daemon enforces.
+        """
+        store = self.build_config.store
+        if store is not None and store.startswith(("local?root=", "/")):
+            return
+        features = get_nix_config("experimental-features").get(
+            "experimental-features", ""
+        )
+        if "ca-derivations" not in features.split():
+            die(
+                "--ca-diff needs the `ca-derivations` experimental feature enabled "
+                f"on the daemon serving --store {store!r}. A client-side flag alone "
+                "can't unlock it for daemon-mediated builds.\n"
+                "Add `experimental-features = ca-derivations` to the daemon's "
+                "nix.conf and restart it, or use a chroot store instead "
+                "(e.g. --store 'local?root=/tmp/ca-diff-store')."
+            )
+
+    def _ca_diff(
+        self,
+        packages_per_system: dict[System, set[str]],
+        base_commit: str,
+        reach_target: Callable[[], None],
+    ) -> dict[System, list[Attr]]:
+        """Build the given attrs as content-addressed derivations on both
+        the currently-checked-out (target) and base revisions, and bucket
+        each by whether its output is provably unchanged.
+        """
+        self._check_ca_daemon_preflight()
+        packages_per_system = filter_packages_per_system(
+            packages_per_system, self.package_filter, self.build_config
+        )
+
+        info("-> Building content-addressed derivations on the reviewed revision")
+        merged_per_system = self._ca_build_all(packages_per_system)
+
+        self._abort_in_progress_merge()
+        self.git_checkout(base_commit)
+        info("-> Building content-addressed derivations on the base revision")
+        base_per_system = self._ca_build_all(packages_per_system)
+
+        reach_target()
+
+        result: dict[System, list[Attr]] = {}
+        for system in packages_per_system:
+            merged_by_name = {a.name: a for a in merged_per_system.get(system, [])}
+            base_by_name = {a.name: a for a in base_per_system.get(system, [])}
+            names = set(merged_by_name) | set(base_by_name)
+            attrs = [
+                self._ca_bucket_attr(merged_by_name.get(name), base_by_name.get(name))
+                for name in names
+            ]
+            self._ca_taint_propagate(attrs)
+            result[system] = attrs
+        return result
 
     def git_worktree(self, commit: str) -> None:
         # Prune stale worktree metadata in case the cache directory was
@@ -624,6 +881,13 @@ class Review:
         for system in list(packages_per_system.keys()):
             if system not in self.systems:
                 packages_per_system.pop(system)
+
+        if self.review_config.ca_diff:
+            return self._ca_diff(
+                packages_per_system,
+                base_rev,
+                lambda: self._checkout_pr_revision(base_rev, head_rev, merge_rev),
+            )
         return self.build(packages_per_system, self.shell_options.build_args)
 
     def start_review(
@@ -650,6 +914,7 @@ class Review:
                 show_logs=self.review_config.show_logs,
                 max_workers=min(32, os.cpu_count() or 1),
                 pkgs=self.build_config.pkgs,
+                ca_diff=self.review_config.ca_diff,
             ),
         )
         report.print_console(path, pr)
@@ -680,7 +945,7 @@ class Review:
         if action.print_result:
             print(report.markdown(path, pr))
 
-        if not self.shell_options.no_shell:
+        if not self.shell_options.no_shell and not self.review_config.ca_diff:
             shell_config = ShellConfig(
                 cache_directory=path,
                 local_system=self.build_config.local_system,
@@ -1052,6 +1317,7 @@ def _review_from_args(
             extra_nixpkgs_config=args.extra_nixpkgs_config,
             systems=args.systems.split(" "),
             eval_type="local",
+            ca_diff=args.ca_diff,
         ),
         shell_options=ShellOptions(
             no_shell=args.no_shell,

@@ -270,8 +270,18 @@ class SystemReport:
         self.blacklisted: list[Attr] = []
         self.tests: list[Attr] = []
         self.built: list[Attr] = []
+        self.ca_unchanged: list[Attr] = []
+        self.ca_changed: list[Attr] = []
+        self.ca_changed_inconclusive: list[Attr] = []
+        self.ca_added: list[Attr] = []
+        self.ca_removed: list[Attr] = []
+        self.ca_build_failed: list[Attr] = []
+        self.ca_not_comparable: list[Attr] = []
 
         for attr in attrs:
+            if attr.ca_bucket is not None:
+                self._bucket_ca_attr(attr)
+                continue
             match attr:
                 case _ if attr.broken:
                     self.broken.append(attr)
@@ -286,6 +296,25 @@ class SystemReport:
                 case _:
                     self.built.append(attr)
 
+    def _bucket_ca_attr(self, attr: Attr) -> None:
+        match attr.ca_bucket:
+            case "unchanged":
+                self.ca_unchanged.append(attr)
+            case "changed":
+                self.ca_changed.append(attr)
+            case "changed-inconclusive":
+                self.ca_changed_inconclusive.append(attr)
+            case "added":
+                self.ca_added.append(attr)
+            case "removed":
+                self.ca_removed.append(attr)
+            case "ca-build-failed":
+                self.ca_build_failed.append(attr)
+                # keep exit-code semantics: a CA build failure fails the run
+                self.failed.append(attr)
+            case "not-comparable":
+                self.ca_not_comparable.append(attr)
+
     def serialize(self) -> dict[str, list[dict]]:
         return {
             "broken": _serialize_attrs(self.broken),
@@ -294,6 +323,13 @@ class SystemReport:
             "failed": _serialize_attrs(self.failed),
             "built": _serialize_attrs(self.built),
             "tests": _serialize_attrs(self.tests),
+            "ca-unchanged": _serialize_attrs(self.ca_unchanged),
+            "ca-changed": _serialize_attrs(self.ca_changed),
+            "ca-changed-inconclusive": _serialize_attrs(self.ca_changed_inconclusive),
+            "ca-added": _serialize_attrs(self.ca_added),
+            "ca-removed": _serialize_attrs(self.ca_removed),
+            "ca-build-failed": _serialize_attrs(self.ca_build_failed),
+            "ca-not-comparable": _serialize_attrs(self.ca_not_comparable),
         }
 
 
@@ -324,6 +360,7 @@ class ReportOptions:
     show_logs: bool = False
     max_workers: int | None = 1
     pkgs: str | None = None
+    ca_diff: bool = False
 
 
 class Report:
@@ -343,6 +380,7 @@ class Report:
         self.checkout = options.checkout
         self.package_filter = package_filter
         self.pkgs = options.pkgs
+        self.ca_diff = options.ca_diff
 
         self.extra_nixpkgs_config = (
             options.extra_nixpkgs_config
@@ -429,6 +467,13 @@ class Report:
         msg += f"Command: `{self._generate_command_string(pr)}`\n"
         if self.commit:
             msg += f"Commit: `{self.commit}`\n"
+        if self.ca_diff:
+            msg += (
+                "\n**CA-diff**: EXPERIMENTAL. `unchanged` is a cryptographic proof "
+                "the output is byte-identical between the base and reviewed "
+                "revision. Everything else means _could not prove unchanged_, "
+                "not necessarily _changed_ (see `not comparable` / `inconclusive`).\n"
+            )
         return msg
 
     def _generate_system_report(self, system: str, report: SystemReport) -> str:
@@ -448,6 +493,25 @@ class Report:
             ":white_check_mark:", report.tests, "built", what="test"
         )
         msg += html_pkgs_section(":white_check_mark:", report.built, "built")
+        msg += html_pkgs_section(
+            ":white_check_mark:", report.ca_unchanged, "provably unchanged (CA)"
+        )
+        msg += html_pkgs_section(":warning:", report.ca_changed, "changed (CA)")
+        msg += html_pkgs_section(
+            ":grey_question:",
+            report.ca_changed_inconclusive,
+            "changed, but inconclusive (tainted by a non-comparable dependency)",
+        )
+        msg += html_pkgs_section(":new:", report.ca_added, "new (CA)")
+        msg += html_pkgs_section(":wastebasket:", report.ca_removed, "removed (CA)")
+        msg += html_pkgs_section(
+            ":x:", report.ca_build_failed, "failed to build as a CA derivation"
+        )
+        msg += html_pkgs_section(
+            ":grey_question:",
+            report.ca_not_comparable,
+            "not comparable (CA opt-out or no override available)",
+        )
         msg += "\n"  # render concatenated multi report.md files correctly
         return msg
 
@@ -485,6 +549,14 @@ class Report:
             info("\nLink to currently reviewing PR:")
             link(to_link(pr_url, pr_url))
 
+        if self.ca_diff:
+            info(
+                "\nCA-diff: 'unchanged' is a cryptographic proof the output is "
+                "byte-identical between base and the reviewed revision. "
+                "Everything else means 'could not prove unchanged', not "
+                "necessarily 'changed'.\n"
+            )
+
         logs_dir = get_log_dir(root)
         for system, report in self.system_reports.items():
             info(f"--------- Report for '{system}' ---------")
@@ -499,6 +571,25 @@ class Report:
             p(report.failed, "failed to build")
             p(report.tests, "built", what="test", log=print)
             p(report.built, "built", log=print)
+            p(
+                report.ca_unchanged,
+                "provably unchanged (identical CA output)",
+                log=print,
+            )
+            p(report.ca_changed, "changed (different CA output)", log=print)
+            p(
+                report.ca_changed_inconclusive,
+                "changed, but inconclusive (tainted by a non-comparable dependency)",
+                log=skipped,
+            )
+            p(report.ca_added, "new in the reviewed revision", log=print)
+            p(report.ca_removed, "removed in the reviewed revision", log=print)
+            p(report.ca_build_failed, "failed to build as a CA derivation")
+            p(
+                report.ca_not_comparable,
+                "not comparable (CA opt-out or no override available)",
+                log=skipped,
+            )
 
         info("Logs can be found under:")
         link(to_link(to_file_uri(logs_dir), str(logs_dir)))
