@@ -214,12 +214,14 @@ def _write_log_for_attr(
     logs: LazyDirectory,
     extra_nix_log_args: list[str],
 ) -> None:
+    store_flags = ["--store", attr.store] if attr.store else []
     with logs.ensure().joinpath(get_log_filename(attr, system)).open("w+") as f:
         subprocess.run(
             [
                 "nix",
                 "--extra-experimental-features",
                 "nix-command",
+                *store_flags,
                 "log",
                 f"{attr.drv_path}^*",
                 *extra_nix_log_args,

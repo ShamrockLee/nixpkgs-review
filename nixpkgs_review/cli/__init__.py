@@ -321,6 +321,14 @@ def common_flags() -> list[CommonFlag]:
             default=None,
             help="Alternative package set to use for building, e.g. pkgsMusl, pkgsStatic, or pkgsCross.aarch64-multiplatform",
         ),
+        CommonFlag(
+            "--store",
+            type=str,
+            default=None,
+            help="Nix store to build in, passed verbatim to nix as `--store` "
+            "(e.g. `local?root=/tmp/review-store`). Defaults to the ambient store. "
+            "Useful for isolating risky/experimental builds from your main store.",
+        ),
     ]
 
 

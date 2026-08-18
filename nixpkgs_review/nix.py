@@ -29,6 +29,7 @@ class BuildConfig:
     num_eval_workers: int = 1
     max_memory_size: int = 4096
     pkgs: str | None = None
+    store: str | None = None
 
 
 @dataclass
@@ -40,6 +41,7 @@ class Attr:
     outputs: dict[str, Path] | None
     drv_path: Path | None
     aliases: list[str] = field(default_factory=list)
+    store: str | None = None
     _path_verified: bool | None = field(init=False, default=None)
 
     def was_build(self) -> bool:
@@ -54,6 +56,7 @@ class Attr:
                 "nix",
                 "--extra-experimental-features",
                 "nix-command",
+                *_store_flags(self.store),
                 "store",
                 "verify",
                 "--no-contents",
@@ -86,7 +89,13 @@ class Attr:
 REVIEW_SHELL: Final[str] = str(ROOT.joinpath("nix/review-shell.nix"))
 
 
-def _nix_common_flags(allow: AllowedFeatures, nix_path: str) -> list[str]:
+def _store_flags(store: str | None) -> list[str]:
+    return ["--store", store] if store else []
+
+
+def _nix_common_flags(
+    allow: AllowedFeatures, nix_path: str, store: str | None = None
+) -> list[str]:
     return [
         "--extra-experimental-features",
         "nix-command",
@@ -96,6 +105,7 @@ def _nix_common_flags(allow: AllowedFeatures, nix_path: str) -> list[str]:
         "--allow-import-from-derivation"
         if allow.ifd
         else "--no-allow-import-from-derivation",
+        *_store_flags(store),
     ]
 
 
@@ -112,6 +122,7 @@ class ShellConfig:
     run: str | None = None
     sandbox: bool = False
     pkgs: str | None = None
+    store: str | None = None
 
 
 def nix_shell(
@@ -131,6 +142,12 @@ def nix_shell(
         nixpkgs_config=config.nixpkgs_config,
         pkgs=config.pkgs,
     )
+    if config.store:
+        warn(
+            "Using a non-default --store: the review shell may fail to launch or "
+            "run binaries built into it, since they are not at the real /nix/store. "
+            "Consider --no-shell, or `nix copy` the results to the default store first."
+        )
     if config.sandbox:
         with TemporaryDirectory(prefix="nixpkgs-review-links-") as dirname:
             bin_link = Path(dirname) / bin_name
@@ -145,6 +162,7 @@ def nix_shell(
             *shell_file_args,
             "--nix-path",
             config.nix_path,
+            *_store_flags(config.store),
             REVIEW_SHELL,
         ]
         if config.run:
@@ -240,6 +258,7 @@ def _nix_shell_sandbox(
         *shell_file_args,
         "--nix-path",
         config.nix_path,
+        *_store_flags(config.store),
         REVIEW_SHELL,
     ]
 
@@ -259,7 +278,7 @@ class NixEvalPropsExtra(TypedDict):
 NixEvalResult = list[NixEvalProps]
 
 
-def _nix_eval_filter(packages: NixEvalResult) -> list[Attr]:
+def _nix_eval_filter(packages: NixEvalResult, store: str | None) -> list[Attr]:
     # workaround https://github.com/NixOS/ofborg/issues/269
     blacklist = {
         "appimage-run-tests",
@@ -293,6 +312,7 @@ def _nix_eval_filter(packages: NixEvalResult) -> list[Attr]:
             blacklisted=name in blacklist,
             outputs=outputs,
             drv_path=drv_path,
+            store=store,
         )
         if attr.drv_path is not None:
             if (other := attr_by_path.get(attr.drv_path)) is None:
@@ -327,7 +347,9 @@ def multi_system_eval(
             "--max-memory-size",
             str(build_config.max_memory_size),
             "--no-instantiate",
-            *_nix_common_flags(build_config.allow, build_config.nix_path),
+            *_nix_common_flags(
+                build_config.allow, build_config.nix_path, build_config.store
+            ),
             "--expr",
             f"(import {eval_script} {{ attr-json = {attr_json.name}; }})",
             "--apply",
@@ -361,7 +383,7 @@ def multi_system_eval(
             systems_packages[system].append(eval_result)
 
         return {
-            system: _nix_eval_filter(packages)
+            system: _nix_eval_filter(packages, build_config.store)
             for system, packages in systems_packages.items()
         }
     finally:
@@ -399,7 +421,9 @@ def nix_build(
         "build",
         "--file",
         REVIEW_SHELL,
-        *_nix_common_flags(build_config.allow, build_config.nix_path),
+        *_nix_common_flags(
+            build_config.allow, build_config.nix_path, build_config.store
+        ),
         "--no-link",
         "--keep-going",
     ]
@@ -424,6 +448,7 @@ def nix_build(
         shell_file_args=shell_file_args,
         allow=build_config.allow,
         nix_path=build_config.nix_path,
+        store=build_config.store,
     )
 
     command += shell_file_args + shlex.split(args)
@@ -471,12 +496,13 @@ def _write_review_shell_drv(
     shell_file_args: list[str],
     allow: AllowedFeatures,
     nix_path: str,
+    store: str | None = None,
 ) -> None:
     review_drv_link: Path = cache_directory / "review-shell.drv"
 
     cmd: list[str] = [
         "nix-instantiate",
-        *_nix_common_flags(allow, nix_path),
+        *_nix_common_flags(allow, nix_path, store),
         *shell_file_args,
         REVIEW_SHELL,
     ]
