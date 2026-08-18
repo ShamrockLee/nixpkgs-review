@@ -329,6 +329,14 @@ def common_flags() -> list[CommonFlag]:
             "(e.g. `local?root=/tmp/review-store`). Defaults to the ambient store. "
             "Useful for isolating risky/experimental builds from your main store.",
         ),
+        CommonFlag(
+            "--eval-store",
+            type=str,
+            default=None,
+            help="Store to write evaluation artifacts (drvs, IFD results) to, "
+            "passed verbatim to nix as `--eval-store` (e.g. `auto`). Useful with "
+            "a remote/slow --store (e.g. nixbuild.net) to keep evaluation local.",
+        ),
     ]
 
 

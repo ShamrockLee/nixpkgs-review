@@ -688,6 +688,7 @@ class Review:
                 sandbox=self.shell_options.sandbox,
                 pkgs=self.build_config.pkgs,
                 store=self.build_config.store,
+                eval_store=self.build_config.eval_store,
             )
             nix_shell(report.built_packages(), shell_config)
 
@@ -1020,6 +1021,7 @@ def build_config_from_args(
         max_memory_size=args.max_memory_size,
         pkgs=args.pkgs,
         store=args.store,
+        eval_store=args.eval_store,
     )
 
 
