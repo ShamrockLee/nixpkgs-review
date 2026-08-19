@@ -420,6 +420,8 @@ class Review:
             self.systems,
             self.build_config.allow,
             self.build_config.pkgs,
+            self.build_config.store,
+            self.build_config.eval_store,
         )
 
         if head_commit is None:
@@ -434,6 +436,8 @@ class Review:
             self.systems,
             self.build_config.allow,
             self.build_config.pkgs,
+            self.build_config.store,
+            self.build_config.eval_store,
             check_meta=True,
         )
 
@@ -766,11 +770,13 @@ def parse_packages_xml(stdout: IO[str]) -> list[Package]:
     return packages
 
 
-def _list_packages_system(
+def _list_packages_system(  # noqa: PLR0913
     system: System,
     nix_path: str,
     allow: AllowedFeatures,
     pkgs: str | None = None,
+    store: str | None = None,
+    eval_store: str | None = None,
     *,
     check_meta: bool = False,
 ) -> list[Package]:
@@ -791,6 +797,8 @@ def _list_packages_system(
         "--allow-import-from-derivation"
         if allow.ifd
         else "--no-allow-import-from-derivation",
+        *(["--store", store] if store else []),
+        *(["--eval-store", eval_store] if eval_store else []),
         *(["-A", pkgs] if pkgs else []),
     ]
     if check_meta:
@@ -806,11 +814,13 @@ def _list_packages_system(
             return parse_packages_xml(f)
 
 
-def list_packages(
+def list_packages(  # noqa: PLR0913
     nix_path: str,
     systems: set[System],
     allow: AllowedFeatures,
     pkgs: str | None = None,
+    store: str | None = None,
+    eval_store: str | None = None,
     *,
     check_meta: bool = False,
 ) -> dict[System, list[Package]]:
@@ -822,6 +832,8 @@ def list_packages(
             allow=allow,
             check_meta=check_meta,
             pkgs=pkgs,
+            store=store,
+            eval_store=eval_store,
         )
 
     return results
