@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from nixpkgs_review.allow import AllowedFeatures
 from nixpkgs_review.cli import parse_args
@@ -72,7 +73,11 @@ def test_nix_common_flags_omits_store_when_unset() -> None:
     assert "--eval-store" not in flags
 
 
-def test_build_config_from_args_carries_store() -> None:
+@patch("nixpkgs_review.review.current_system", return_value="x86_64-linux")
+def test_build_config_from_args_carries_store(mock_current_system: MagicMock) -> None:
+    # current_system() shells out to `nix eval`; mocked so this test doesn't
+    # depend on ambient Nix state (e.g. a writable profile dir), which isn't
+    # available in a Nix build sandbox.
     args = parse_args(
         "nixpkgs-review",
         ["rev", "HEAD", "--store", "local?root=/tmp/x", "--eval-store", "auto"],
@@ -82,3 +87,4 @@ def test_build_config_from_args_carries_store() -> None:
     )
     assert build_config.store == "local?root=/tmp/x"
     assert build_config.eval_store == "auto"
+    assert build_config.local_system == mock_current_system.return_value
